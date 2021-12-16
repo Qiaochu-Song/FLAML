@@ -30,6 +30,7 @@ from .data import (
 import pandas as pd
 from pandas import DataFrame, Series
 import sys
+import pickle
 
 try:
     import psutil
@@ -43,6 +44,9 @@ except ImportError:
 logger = logging.getLogger("flaml.automl")
 FREE_MEM_RATIO = 0.2
 
+import torch
+from flaml.nlp.huggingface.distill.distiller import Distiller
+from flaml.nlp.huggingface.distill.lm_seqs_dataset import LmSeqsDataset
 
 def TimeoutHandler(sig, frame):
     raise TimeoutError(sig, frame)
@@ -286,6 +290,248 @@ class BaseEstimator:
         """
         params = config.copy()
         return params
+
+
+class DistilBertEstimator(BaseEstimator):
+    """
+    The class for distilling bert models, using class distiller
+    """
+    from transformers import (# GPT2Config,; GPT2LMHeadModel,; GPT2Tokenizer,; RobertaConfig,; RobertaForMaskedLM,; RobertaTokenizer,
+        BertConfig,
+        BertForMaskedLM,
+        BertTokenizer,
+        DistilBertConfig,
+        DistilBertForMaskedLM,
+        DistilBertTokenizer,
+    )
+    MODEL_CLASSES = {
+    "distilbert": (DistilBertConfig, DistilBertForMaskedLM, DistilBertTokenizer),
+    # "roberta": (RobertaConfig, RobertaForMaskedLM, RobertaTokenizer),
+    "bert": (BertConfig, BertForMaskedLM, BertTokenizer),
+    # "gpt2": (GPT2Config, GPT2LMHeadModel, GPT2Tokenizer),
+    }
+
+    # Not sure if we should keep this, since some of these may be hps to search
+    # THIS is passed in as config, a dict, and set to self.params in self.__init__()
+    # by "self.params = self.config2params(config)""
+    # use the settings below for test & debugging
+    # from dataclasses import dataclass
+    # @dataclass
+    # class Args:
+    #     data_file: str
+    #     student_config: str
+    #     temperature: float = 2.0
+    #     alpha_ce: float = 0.0
+    #     alpha_mlm: float = 0.0
+    #     alpha_clm: float = 0.5
+    #     alpha_mse: float = 0.0
+    #     alpha_cos: float = 0.0
+    #     mlm_mask_prop: float = 0.15
+    #     word_mask: float = 0.8
+    #     word_keep: float = 0.1
+    #     word_rand: float = 0.1
+    #     mlm_smoothing: float = 0.1
+    #     mlm_smoothing: float = 0.7
+    #     n_epoch: int = 3
+    #     batch_size: int = 5
+    #     gradient_accumulation_steps: int = 50
+    #     warmup_prop: float = 0.05
+    #     weight_decay: float = 0.0
+    #     learning_rate: float = 5e-4
+    #     adam_epsilon: float = 1e-6
+    #     max_grad_norm: float = 5.0
+    #     initializer_range: float = 0.02
+
+    #     # no need to change (?)
+    #     seed: int = 56
+    #     log_interval: int = 500
+    #     checkpoint_interval: int = 4000
+    #     teacher_name: str = "The teacher model."
+
+    #     dump_path: str = str(Path("./models").resolve())
+
+    def __init__(self, task="distil-bert-opt", **config):
+        
+        from flaml.nlp.huggingface.distill.distiller import Distiller
+        from flaml.nlp.huggingface.distill.lm_seqs_dataset import LmSeqsDataset
+        import uuid
+
+        super().__init__(task, **config)
+        self.distiller_
+        self.trial_id = str(uuid.uuid1().hex)[:8]
+
+    def _join(self, X_train:DataFrame, y_train:Series)->DataFrame:
+        y_train = DataFrame(y_train, columns=["label"], index=X_train.index)
+        train_df = X_train.join(y_train)
+        return train_df
+    
+    @classmethod
+    def search_space(cls, **params):
+        # TODO: custimize search space for each, like GPT should use clm not mlm, so alpha_mlm = 0
+        return {
+            "learning_rate": {
+                "domain": tune.loguniform(lower=1e-6, upper=1e-3),
+                "init_value": 1e-5,
+            },
+            "num_train_epochs": {
+                "domain": tune.loguniform(lower=0.1, upper=10.0),
+            },
+            "per_device_train_batch_size": {
+                "domain": tune.choice([4, 8, 16, 32]),
+                "init_value": 32,
+            },
+            "warmup_ratio": {
+                "domain": tune.uniform(lower=0.0, upper=0.3),
+                "init_value": 0.0,
+            },
+            "weight_decay": {
+                "domain": tune.uniform(lower=0.0, upper=0.3),
+                "init_value": 0.0,
+            },
+            "adam_epsilon": {
+                "domain": tune.loguniform(lower=1e-8, upper=1e-6),
+                "init_value": 1e-6,
+            },
+            "seed": {"domain": tune.choice(list(range(40, 45))), "init_value": 42},
+            "global_max_steps": {"domain": sys.maxsize, "init_value": sys.maxsize},
+            "alpha_ce":{"domain":tune.uniform(lower=0.0, upper=1.0),"init_value": 0.5},
+            "alpha_mlm": {"domain": tune.uniform(lower=0.0, upper=1.0),"init_value": 0.0}, # if mlm, use mlm over clm
+            "alpha_clm": {"domain": tune.uniform(lower=0.0, upper=1.0),"init_value": 0.5},
+            "alpha_mse": {"domain": tune.uniform(lower=0.0, upper=1.0),"init_value": 0.0},
+            "alpha_cos": {"domain": tune.uniform(lower=0.0, upper=1.0), "init_value": 0.0},
+        }
+
+    
+    def _preprocess(self, X):
+        '''preprocess X by a certain tokenizer'''
+        # TODO: determine the tokenizer should be here or in the self._preprocess()
+        # get tokenizer type
+        teacher_config_class, teacher_model_class, teacher_tokenizer_class = self.MODEL_CLASSES[self.params.teacher_type]
+        tokenizer = teacher_tokenizer_class.from_pretrained(self.params.teacher_name)       
+        # special (removed) token ids
+        special_tok_ids = {}
+        for tok_name, tok_symbol in tokenizer.special_tokens_map.items():
+            idx = tokenizer.all_special_tokens.index(tok_symbol)
+            special_tok_ids[tok_name] = tokenizer.all_special_ids[idx]
+        self.params.special_tok_ids = special_tok_ids
+        self.params.max_model_input_size = tokenizer.max_model_input_sizes[self.params.teacher_name]
+        return X
+
+    def fit(self, X_train: DataFrame, y_train: Series, budget=None, **kwargs):
+        # DELETE THIS LINE BELOW
+        #args = self.Args()
+
+        # student_config_class, student_model_class, _ = self.MODEL_CLASSES["distilbert"]
+        # teacher_config_class, teacher_model_class, teacher_tokenizer_class = self.MODEL_CLASSES['bert']
+        # NOTE: if performing cross model distill, uncomment below to replace the above two lines
+        # ****DEBUGGING****
+        import pdb
+        print(self.params)
+        pdb.set_trace()
+        # *****************
+
+        # TODO: _init_hpo_args
+        student_config_class, student_model_class, _ = DistilBertEstimator.MODEL_CLASSES[self.params.student_type]
+        teacher_config_class, teacher_model_class, teacher_tokenizer_class = DistilBertEstimator.MODEL_CLASSES[self.params.teacher_type]
+
+        # TOKENIZER
+        # TODO: determine the tokenizer should be here or in the self._preprocess()
+    
+        tokenizer = teacher_tokenizer_class.from_pretrained(self.params.teacher_name)       
+        # special (removed) token ids
+        special_tok_ids = {}
+        for tok_name, tok_symbol in tokenizer.special_tokens_map.items():
+            idx = tokenizer.all_special_tokens.index(tok_symbol)
+            special_tok_ids[tok_name] = tokenizer.all_special_ids[idx]
+        self.params.special_tok_ids = special_tok_ids
+        self.params.max_model_input_size = tokenizer.max_model_input_sizes[self.params.teacher_name]
+
+        # TEACHER #
+        teacher = teacher_model_class.from_pretrained(
+            self.params.teacher_name, output_hidden_states=True
+        )
+       
+        # STUDENT
+        stu_architecture_config = student_config_class.from_pretrained(self.params.student_config)
+        stu_architecture_config.output_hidden_states = True
+        student = student_model_class(stu_architecture_config)
+        
+        # DATALOADER
+        # transform the (X_train, y_train) into LmSeqsDataset
+        # if validation set exists, do transformation too
+        X_val = kwargs.get("X_val")
+        y_val = kwargs.get("y_val")
+
+        X_train = self._preprocess(X_train, self._task, **kwargs)
+        train_lm_seq_dataset = LmSeqsDataset.from_pandas(df=self._join(X_train, y_train))
+
+        if X_val is not None:
+            X_val = self._preprocess(X_val, self._task, **kwargs)
+            eval_dataset = LmSeqsDataset.from_pandas(df=self._join(X_val, y_val))
+        else:
+            eval_dataset = None
+        if self.params.mlm:
+            # logger.info(f"Loading token counts from {self.params.token_counts} (already pre-computed)")
+            # TODO: if mlm, need to have a pre-computed "token_counts" in self.params. 
+            with open(self.params.token_counts, "rb") as fp:
+                counts = pickle.load(fp)
+
+            token_probs = np.maximum(counts, 1) ** -self.params.mlm_smoothing
+            for idx in special_tok_ids.values():
+                token_probs[idx] = 0.0  # do not predict special tokens
+            token_probs = torch.from_numpy(token_probs)
+        else:
+            token_probs = None
+
+        self.model = Distiller(
+            params=self.params,
+            dataset=train_lm_seq_dataset,
+            token_probs=token_probs,
+            student=student,
+            teacher=teacher,
+        )
+
+        # TODO: GPT and Roberta do freezing? or maybe not?
+        self.model.train()
+
+    def predict(self, X_test: DataFrame, **kwargs):
+        # TODO: transform X_test into LmSeqsDataset
+        X_test = self._preprocess(X_test, self._task, **kwargs)
+        test_lm_seq_dataset = LmSeqsDataset.from_pandas(df=X_test)
+        # then call self.model.prepare_batch_mlm / clm to prepare input_ids and attn_mask
+        if self.model.mlm:
+            token_ids, attn_mask, clm_labels = self.model.prepare_batch_mlm(test_lm_seq_dataset)
+            student_outputs = self.model.student(
+                    input_ids=token_ids, attention_mask=attn_mask
+                )  # (bs, seq_length, voc_size)
+        else:
+            token_ids, attn_mask, clm_labels = self.model.prepare_batch_clm()
+            student_outputs = self.model.student(
+                input_ids=token_ids, attention_mask=None
+            )  # (bs, seq_length, voc_size)
+        return np.argmax(student_outputs["logits"].reshape((len(token_ids),)),axis=1)
+        
+    
+    def predict_proba(self, X_test: DataFrame, **kwargs):
+        # TODO: transform X_test into LmSeqsDataset
+        X_test = self._preprocess(X_test, self._task, **kwargs)
+        test_lm_seq_dataset = LmSeqsDataset.from_pandas(df=X_test)
+        # then call self.model.prepare_batch_mlm / clm to prepare input_ids and attn_mask
+        if self.model.mlm:
+            token_ids, attn_mask, clm_labels = self.model.prepare_batch_mlm(test_lm_seq_dataset)
+            student_outputs = self.model.student(
+                    input_ids=token_ids, attention_mask=attn_mask
+                )  # (bs, seq_length, voc_size)
+        else:
+            token_ids, attn_mask, clm_labels = self.model.prepare_batch_clm()
+            student_outputs = self.model.student(
+                input_ids=token_ids, attention_mask=None
+            )  # (bs, seq_length, voc_size)
+        return student_outputs["logits"].reshape((len(token_ids),))
+
+    def cleanup(self):
+        del self._model
+        self._model = None
 
 
 class TransformersEstimator(BaseEstimator):
