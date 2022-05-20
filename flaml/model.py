@@ -2140,7 +2140,7 @@ class MultiModalEstimator(BaseEstimator):
     def _init_ag_args(self, automl_fit_kwargs: dict = None):
         from .nlp.utils import AGArgs
 
-        ag_args = AGArgs()
+        ag_args = AGArgs(**automl_fit_kwargs["ag_args"])
         for key, val in automl_fit_kwargs["ag_args"].items():
             assert (
                 key in ag_args.__dict__
@@ -2173,10 +2173,18 @@ class MultiModalEstimator(BaseEstimator):
         model = TextPredictor(path=self.model_path,
                               label="label",
                               problem_type=self._task[3:],
-                              eval_metric=kwargs["metric"],
+                              eval_metric=self._kwargs["metric"],
+                              verbosity=3,
                               backend=self.ag_args.backend)
         train_data = BaseEstimator._join(X_train, y_train)
-        tuning_data = BaseEstimator._join(kwargs.get("X_val"), kwargs.get("y_val"))
+        # use valid data for early stopping
+        X_val = kwargs.get("X_val")
+        y_val = kwargs.get("y_val")
+        if X_val is not None and y_val is not None:
+            tuning_data = BaseEstimator._join(X_val, y_val)
+        else:
+            tuning_data = None
+        # NOTE: if no tuning_data, model.fit() will holdout a fraction from train_data for early stopping
         model.fit(train_data=train_data,
                   tuning_data=tuning_data,
                   hyperparameters=hyperparameters,
