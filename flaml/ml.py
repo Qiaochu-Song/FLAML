@@ -37,6 +37,7 @@ from .model import (
     ARIMA,
     SARIMAX,
     TransformersEstimator,
+    MultiModalEstimator,
     TransformersEstimatorModelSelection,
 )
 from .data import CLASSIFICATION, group_counts, TS_FORECAST, TS_VALUE_COL
@@ -122,6 +123,8 @@ def get_estimator_class(task, estimator_name):
         estimator_class = SARIMAX
     elif estimator_name == "transformer":
         estimator_class = TransformersEstimator
+    elif estimator_name == "multimodal":
+        estimator_class = MultiModalEstimator
     elif estimator_name == "transformer_ms":
         estimator_class = TransformersEstimatorModelSelection
     else:
@@ -584,7 +587,7 @@ def compute_estimator(
         n_jobs=n_jobs,
     )
 
-    if isinstance(estimator, TransformersEstimator):
+    if isinstance(estimator, (TransformersEstimator, MultiModalEstimator)):
         fit_kwargs["metric"] = eval_metric
         fit_kwargs["X_val"] = X_val
         fit_kwargs["y_val"] = y_val
@@ -649,6 +652,8 @@ def train_estimator(
         n_jobs=n_jobs,
     )
     if isinstance(estimator, TransformersEstimator):
+        fit_kwargs["metric"] = eval_metric
+    elif isinstance(estimator, MultiModalEstimator):
         fit_kwargs["metric"] = eval_metric
 
     if X_train is not None:
