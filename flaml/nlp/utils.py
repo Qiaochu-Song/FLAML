@@ -489,12 +489,14 @@ class AGArgs:
         per_device_batch_size (int, optional, defaults to 8)
         num_train_epochs (int, optional, defaults to 10)
         batch_size (int, optional, defaults to 128)
+        cat_to_text (bool, optional, defaults to True): convert categorical fields to text
     """
     output_dir: str = field(default="data/mm_output/", metadata={"help": "data dir", "required": True})
     hf_model_path: str = field(default="google/electra-base-discriminator", metadata={"help": "Hugging Face model path"})
     per_device_batch_size: int = field(default=8, metadata={"help": "per device batch size"})
     num_train_epochs: int = field(default=10, metadata={"help": "number of train epochs"})
     batch_size: int = field(default=128, metadata={"help": "batch size"})
+    cat_to_text: int = field(default=True, metadata={"help": "convert categorical to text"})
     hyperparameters: dict = field(init=False)
 
     def __post_init__(self):
@@ -510,6 +512,7 @@ class AGArgs:
         self.hyperparameters["env.per_gpu_batch_size"] = self.per_device_batch_size
         self.hyperparameters["env.batch_size"] = self.batch_size
         self.hyperparameters["optimization.max_epochs"] = self.num_train_epochs
+        self.hyperparameters["data.categorical.convert_to_text"] = self.cat_to_text
 
     @staticmethod
     def load_args():

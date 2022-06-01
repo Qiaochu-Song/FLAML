@@ -2163,7 +2163,7 @@ class MultiModalEstimator(BaseEstimator):
             },
             "optimization.weight_decay": {
                 "domain": tune.choice([1E-4, 1E-3, 1E-2]),
-                "init_value": 1E-4,
+                "init_value": 1E-3,
             },
             "optimization.warmup_steps": {
                 "domain": tune.choice([0.1, 0.2]),
